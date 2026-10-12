@@ -8,6 +8,14 @@
 
 ---
 
+## 兼容性
+
+支持 KiraAI 2.33+ 与 3.0 全系列（含 v3.0.0-rc.1；特征识别，不绑版本号）。
+v2.1.5：适配 3.0 rc.1 的会话接口全异步化与 SQLite 持久化——新增双世代会话层
+（读 `get_session`/`flatten_content`，写 `update_session(sid, content=)` upsert，
+写穿式重开照旧保留会话标题与能力设置；delete 路径已 await 化）。
+测试桩同步双世代化：3.0 下用真 SQLite 会话库跑全套集成测试。
+
 ## 先跑起来
 
 1. 把整个 `KiraAI_auto_delete_session_plugin-main` 文件夹放进 KiraAI 的 `data/plugins/` 目录。

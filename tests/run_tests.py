@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import importlib.util
 import json
 import os
@@ -37,6 +38,27 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+
+
+# ── 双世代会话桩助手（仅测试侧）：2.x 同步 API 直调；3.0 异步 API await ──
+async def _sm_flat(sess, sid):
+    if hasattr(sess, "fetch_memory"):
+        return list(sess.fetch_memory(sid) or [])
+    s = await sess.get_session(sid, ensure_session=False)
+    return (s.flatten_content() if s else []) or []
+
+
+async def _sm_count(sess, sid):
+    if hasattr(sess, "get_memory_count"):
+        return sess.get_memory_count(sid)
+    s = await sess.get_session(sid, ensure_session=False)
+    return len(s.content) if s else 0
+
+
+async def _sm_append(sess, sid, chunk):
+    r = sess.update_memory(sid, chunk)
+    if inspect.isawaitable(r):
+        await r
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CHECKS: list[tuple[str, bool, str]] = []
@@ -141,7 +163,9 @@ def main() -> int:
     cfg = KiraConfig()
     cfg["bot_config"]["bot"]["max_memory_length"] = 50
     cfg["bot_config"]["bot"]["dynamic_prompt_position"] = "system"
-    sess = SessionManager(db=None, kira_config=cfg, event_bus=None)
+    # 会话管理器在 main_run()（asyncio.run 的循环内）按世代构造：
+    # 2.x 直接内存形态；3.0 需要真 SQLite 库且 initialize() 是异步。
+    sess = None
 
     class FakeLLMClient:
         def __init__(self):
@@ -228,12 +252,28 @@ def main() -> int:
 
     async def seed(sid, n, tag="", size=200):
         for i in range(n):
-            sess.update_memory(sid, [
+            await _sm_append(sess, sid, [
                 {"role": "user", "content": f"{tag}Q{i}-" + "x" * size},
                 {"role": "assistant", "content": f"{tag}A{i}-" + "y" * size},
             ])
 
     async def main_run():
+        nonlocal sess
+        _probe = SessionManager(db=None, kira_config=cfg, event_bus=None)
+        if hasattr(_probe, "fetch_memory"):
+            sess = _probe  # 2.x：内存 JSON 形态
+        else:
+            # 3.0：会话持久化在 SQLite —— 起真库（临时文件）跑真实持久化路径
+            from core.db.db_mgr import DatabaseManager
+            from core.db.service import DatabaseService
+            _db_file = Path(tempfile.mkdtemp(prefix="ads_gen3_")) / "test.db"
+            _dbm = DatabaseManager(f"sqlite+aiosqlite:///{_db_file}")
+            await _dbm.init()
+            _svc = DatabaseService(_dbm)
+            await _svc.init_tables()  # 建表（含 database_migrations）
+            sess = SessionManager(db=_svc, kira_config=cfg, event_bus=None)
+            await sess.initialize()
+        ctx.session_mgr = sess  # 构造完成后挂回共享 ctx（占位期是 None）
         from core.chat import Session, MessageChain, User
         from core.chat.message_utils import (KiraMessageBatchEvent, KiraMessageEvent,
                                              KiraIMMessage)
@@ -285,14 +325,14 @@ def main() -> int:
         pend_final = pend.get("final") if pend else ""
         await seed(sid3, 1, "turn")  # 回合结束追加（状态前移一轮 —— 旧实现收割必失败）
         calls_before = len(client.calls)
-        flat = sess.fetch_memory(sid3)
+        flat = await _sm_flat(sess, sid3)
         req = LR(messages=flat[:])
         ev = KiraMessageBatchEvent(message_types=["dm"], timestamp=0,
                                    session=Session(adapter_name="test", session_type="dm", session_id="s03"))
         plugin.last_check.clear(); plugin._last_reset_time.clear(); plugin._token_still_over.clear()
         await plugin.maybe_reset_session(ev, req)
         in_reset = len(client.calls) - calls_before
-        head = str(sess.fetch_memory(sid3)[0].get("content", ""))
+        head = str((await _sm_flat(sess, sid3))[0].get("content", ""))
         check("S04 重开零同步 LLM 调用", in_reset == 0, f"calls={in_reset}")
         check("S04 头部摘要来自收割结果", bool(pend_final) and pend_final[:40] in head)
         await asyncio.sleep(1.2)
@@ -317,7 +357,7 @@ def main() -> int:
         if t:
             await asyncio.wait_for(asyncio.shield(t), 15)
         run1 = client.calls[c0:]
-        sess.update_memory(sid5, [{"role": "user", "content": "U6-" + "x" * 300},
+        await _sm_append(sess, sid5, [{"role": "user", "content": "U6-" + "x" * 300},
                                   {"role": "assistant", "content": "A6-" + "y" * 300}])
         c1 = len(client.calls)
         plugin5._schedule_continuous_compression(sid5)
@@ -344,12 +384,12 @@ def main() -> int:
         check("S06 首次重开写入累计摘要", bool(s1))
         cfg["bot_config"]["bot"]["max_memory_length"] = 4
         for _ in range(4):
-            sess.update_memory(sid6, [{"role": "user", "content": "N"},
+            await _sm_append(sess, sid6, [{"role": "user", "content": "N"},
                                       {"role": "assistant", "content": "n"}])
-        head_missing = not str(sess.fetch_memory(sid6)[0].get("content", "")).startswith("[前情摘要")
+        head_missing = not str((await _sm_flat(sess, sid6))[0].get("content", "")).startswith("[前情摘要")
         check("S06 原生截断确实吃掉头部摘要", head_missing)
         # S08：截断后的请求收到内存桥（隔离重置路径：抬高阈值 + 清理节流状态）
-        req6 = LR(messages=sess.fetch_memory(sid6)[:])
+        req6 = LR(messages=(await _sm_flat(sess, sid6))[:])
         ev6 = KiraMessageBatchEvent(message_types=["dm"], timestamp=0,
                                     session=Session(adapter_name="test", session_type="dm", session_id="s06"))
         plugin6.max_tokens = 10 ** 12
@@ -357,7 +397,7 @@ def main() -> int:
         plugin6._last_reset_time.clear()
         await plugin6.maybe_reset_session(ev6, req6)
         first6 = getattr(req6.messages[0], "content", "") if req6.messages else ""
-        mem_head6 = str(sess.fetch_memory(sid6)[0].get("content", ""))
+        mem_head6 = str((await _sm_flat(sess, sid6))[0].get("content", ""))
         check("S08 内存桥将摘要注入请求", str(first6).startswith("[前情摘要"))
         check("S08 内存桥不写记忆", not mem_head6.startswith("[前情摘要"))
         # S06b：再次重开时累计信息保留
@@ -376,8 +416,8 @@ def main() -> int:
         sid7 = "test:dm:s07"
         await seed(sid7, 8, "c")
         await plugin7._do_reset_with_summary(sid7, 5, reason="clamp")
-        n7 = sess.get_memory_count(sid7)
-        head7 = str(sess.fetch_memory(sid7)[0].get("content", ""))
+        n7 = await _sm_count(sess, sid7)
+        head7 = str((await _sm_flat(sess, sid7))[0].get("content", ""))
         check("S07 tokens 模式下 keep 被钳制到窗口-1", n7 <= 4, f"chunks={n7}")
         check("S07 钳制后头部摘要保留", head7.startswith("[前情摘要"))
         cfg["bot_config"]["bot"]["max_memory_length"] = 50
@@ -446,7 +486,8 @@ def main() -> int:
         check("S11 反馈保留轮数为钳制后的 4", "保留最近 4 轮" in reply11, reply11[:60])
         check("S11 成功文案与 schema 默认一致",
               plugin11.reset_success_message == schema["section_command"]["fields"]["reset_success_message"]["default"])
-        check("S11 记忆已重写", sess.get_memory_count(sid11) <= 4, f"chunks={sess.get_memory_count(sid11)}")
+        _n11 = await _sm_count(sess, sid11)
+        check("S11 记忆已重写", _n11 <= 4, f"chunks={_n11}")
         cfg["bot_config"]["bot"]["max_memory_length"] = 50
         await plugin11.terminate()
 
@@ -457,7 +498,7 @@ def main() -> int:
         await plugin12.initialize()
         sid12 = "test:dm:s12"
         for i in range(6):
-            sess.update_memory(sid12, [
+            await _sm_append(sess, sid12, [
                 {"role": "user", "content": f"u{i}"},
                 {"role": "assistant", "content": "",
                  "tool_calls": [{"id": f"t{i}", "type": "function",
@@ -466,7 +507,7 @@ def main() -> int:
                 {"role": "tool", "tool_call_id": f"t{i}", "name": "search", "content": "tool result " * 30},
                 {"role": "assistant", "content": f"a{i}"},
             ])
-        req12 = LR(messages=sess.fetch_memory(sid12)[:])
+        req12 = LR(messages=(await _sm_flat(sess, sid12))[:])
         req12.system_prompt = [Prompt("SYS", name="role"), Prompt("T", name="time")]
         req12.user_prompt = [Prompt("hello", name="message")]
         ev12 = KiraMessageBatchEvent(message_types=["dm"], timestamp=0,
@@ -494,13 +535,13 @@ def main() -> int:
         sid13 = "test:dm:s13"
         await seed(sid13, 8, "o")
         calls0 = len(client.calls)
-        req13 = LR(messages=sess.fetch_memory(sid13)[:])
+        req13 = LR(messages=(await _sm_flat(sess, sid13))[:])
         ev13 = KiraMessageBatchEvent(message_types=["dm"], timestamp=0,
                                      session=Session(adapter_name="test", session_type="dm", session_id="s13"))
         plugin13.last_check.clear(); plugin13._token_still_over.clear()
         await plugin13.maybe_reset_session(ev13, req13)
         check("S13 off 模式重置不调用 LLM", len(client.calls) - calls0 == 0)
-        flat13 = sess.fetch_memory(sid13)
+        flat13 = await _sm_flat(sess, sid13)
         check("S13 off 模式不产生摘要", not str(flat13[0].get("content", "")).startswith("[前情摘要"))
         await plugin13.terminate()
 
