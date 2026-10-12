@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import time
 from collections import defaultdict
 from typing import Any, List, Dict, Optional
@@ -233,11 +234,17 @@ class AutoDeleteSessionPlugin(BasePlugin):
             logger.error("AutoDelete: 无法找到 SessionManager，插件无法工作")
             return
 
-        required = ['fetch_memory', 'read_memory', 'write_memory', 'delete_session',
-                    'get_session_info', 'get_memory_count']
-        missing = [m for m in required if not hasattr(self.session_mgr, m)]
-        if missing:
-            logger.error(f"AutoDelete: SessionManager 缺少方法: {missing}")
+        # 世代形态识别（特征探测，不绑版本号）：
+        #   2.x  = 同步记忆 API（fetch_memory/read_memory/write_memory/...）
+        #   3.0+ = 全异步会话接口（get_session/update_session/...，SQLite 持久化）
+        _req_2x = ('fetch_memory', 'read_memory', 'write_memory', 'delete_session')
+        _req_rc1 = ('get_session', 'update_session', 'delete_session')
+        if all(hasattr(self.session_mgr, n) for n in _req_2x):
+            self._sm_gen = 'sync'
+        elif all(hasattr(self.session_mgr, n) for n in _req_rc1):
+            self._sm_gen = 'async'
+        else:
+            logger.error('AutoDelete: SessionManager 接口形态无法识别（既非旧版同步式也非新版异步式）')
             self.session_mgr = None
             return
 
@@ -746,21 +753,64 @@ class AutoDeleteSessionPlugin(BasePlugin):
             chunks = [[summary_msg]]
         return chunks
 
-    def _write_back(self, sid: str, new_chunks: List[List[dict]]):
-        """写回新记忆。write_through（默认）：直接覆写，保留 title/description；
-        否则走旧的 delete + 重建路径。"""
+    # ── 双世代会话层（特征识别，不绑版本号）──────────────────────────────
+    # 2.x：同步记忆 API（fetch_memory/read_memory/write_memory/get_session_info/
+    #   get_memory_count，直读 chat_memory 缓存）。
+    # 3.0 rc.1+：全异步（get_session/update_session(content=)/delete_session），
+    #   SQLite 持久化无常驻缓存；update_session 为 upsert，content 整体替换，
+    #   标题/描述/能力设置等元数据全部保留。
+    async def _sm_read_flat(self, sid: str) -> list:
+        sm = self.session_mgr
+        if hasattr(sm, "fetch_memory"):
+            return list(sm.fetch_memory(sid) or [])
+        s = await sm.get_session(sid, ensure_session=False)
+        return (s.flatten_content() if s else []) or []
+
+    async def _sm_read_chunks(self, sid: str) -> list:
+        sm = self.session_mgr
+        if hasattr(sm, "read_memory"):
+            return [list(c) for c in (sm.read_memory(sid) or [])]
+        s = await sm.get_session(sid, ensure_session=False)
+        return [list(c) for c in (s.content if s else [])]
+
+    async def _sm_count(self, sid: str) -> int:
+        sm = self.session_mgr
+        if hasattr(sm, "get_memory_count"):
+            return sm.get_memory_count(sid)
+        s = await sm.get_session(sid, ensure_session=False)
+        return len(s.content) if s else 0
+
+    async def _sm_write_chunks(self, sid: str, chunks) -> None:
+        sm = self.session_mgr
+        if hasattr(sm, "write_memory"):
+            sm.write_memory(sid, chunks)
+            return
+        await sm.update_session(sid, content=chunks)
+
+    async def _write_back(self, sid: str, new_chunks: List[List[dict]]):
+        """写回新记忆。write_through（默认）：直接覆写，保留 title/description/
+        capabilities；否则走 delete + 重建路径（3.0 下删除后 update_session upsert 自建）。"""
+        sm = self.session_mgr
         if self.write_through:
-            data = getattr(self.session_mgr, "chat_memory", None)
-            if not isinstance(data, dict) or sid not in data:
-                # write_memory 是下标赋值，session 必须先存在
-                self.session_mgr.get_session_info(sid)
-            self.session_mgr.write_memory(sid, new_chunks)
+            if hasattr(sm, "write_memory"):
+                data = getattr(sm, "chat_memory", None)
+                if not isinstance(data, dict) or sid not in data:
+                    # write_memory 是下标赋值，session 必须先存在
+                    sm.get_session_info(sid)
+                sm.write_memory(sid, new_chunks)
+            else:
+                await sm.update_session(sid, content=new_chunks)
             logger.info(f"✅ 新历史已覆写（write-through）: {len(new_chunks)} 个chunk")
             return
-        self.session_mgr.delete_session(sid)
+        res = sm.delete_session(sid)
+        if inspect.isawaitable(res):
+            await res
         logger.info(f"会话 {sid} 已删除（旧路径）")
-        self.session_mgr.get_session_info(sid)
-        self.session_mgr.write_memory(sid, new_chunks)
+        if hasattr(sm, "write_memory"):
+            sm.get_session_info(sid)
+            sm.write_memory(sid, new_chunks)
+        else:
+            await sm.update_session(sid, content=new_chunks)
         logger.info(f"✅ 新历史已写入: {len(new_chunks)} 个chunk")
 
     # ── 后台合并辅助 ─────────────────────────────────────────────
@@ -996,7 +1046,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
             async with self._preheat_sem:
                 if self.session_mgr is None:
                     return
-                flat = self.session_mgr.fetch_memory(sid) or []
+                flat = await self._sm_read_flat(sid)
                 head_text, rest = self._split_head_summary(flat)
                 chunks = self._clean_and_chunk(rest)
                 keep = self._dynamic_keep_turns.get(sid, self.keep_recent_turns)
@@ -1117,7 +1167,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                 if not delta or self.session_mgr is None:
                     return
                 async with self._get_lock(sid):
-                    chunks = self.session_mgr.read_memory(sid) or []
+                    chunks = await self._sm_read_chunks(sid)
                     head_text = ""
                     if chunks and is_summary_chunk(chunks[0]):
                         head_text = extract_summary_text(
@@ -1143,7 +1193,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                         chunks[0] = [summary_msg] + list(chunks[0])
                     else:
                         chunks = [[summary_msg]]
-                    self.session_mgr.write_memory(sid, chunks)
+                    await self._sm_write_chunks(sid, chunks)
                     if self.cumulative_summary and self._summary_store is not None:
                         self._summary_store.set(sid, final)
                         self._summary_store.save()
@@ -1197,7 +1247,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         if self.enable_summary_logging:
             logger.info(f"[摘要调试] 摘要模式={self.summarize_mode}, 保留轮数={keep_turns}")
 
-        old_flat = self.session_mgr.fetch_memory(sid) or []
+        old_flat = await self._sm_read_flat(sid)
         logger.info(f"旧历史消息数: {len(old_flat)}")
         if not old_flat:
             logger.info(f"会话 {sid} 没有可压缩的历史，跳过重开")
@@ -1302,7 +1352,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
 
         # 5) 融合布局写回
         fused = self._build_fused_chunks(new_chunks, final)
-        self._write_back(sid, fused)
+        await self._write_back(sid, fused)
 
         # 6) 累计摘要落盘
         if self.cumulative_summary and self._summary_store is not None:
@@ -1402,7 +1452,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         keep_turns = self._clamped_keep(self.keep_recent_turns)
         try:
             # 没有可压缩的历史：给出明确反馈，不写入、不标记重开
-            if not (self.session_mgr.fetch_memory(sid) or []):
+            if not (await self._sm_read_flat(sid)):
                 await self._reply(sid, self.reset_empty_message)
                 return
             # 标记本次手动重开，避免 llm_request 钩子在同一时刻又自动重开
@@ -1451,11 +1501,11 @@ class AutoDeleteSessionPlugin(BasePlugin):
             return
         try:
             total_tokens = 0
-            flat = self.session_mgr.fetch_memory(sid) or []
+            flat = await self._sm_read_flat(sid)
             for msg in flat:
                 content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
                 total_tokens += self.count_tokens(content)
-            rounds = self.session_mgr.get_memory_count(sid)
+            rounds = await self._sm_count(sid)
             if self._should_compress_continuously(sid, total_tokens, rounds):
                 self._schedule_continuous_compression(sid)
 
@@ -1463,11 +1513,11 @@ class AutoDeleteSessionPlugin(BasePlugin):
             new_summary = self._pending_replace.pop(sid, None)
             if new_summary:
                 async with self._get_lock(sid):
-                    chunks = self.session_mgr.read_memory(sid) or []
+                    chunks = await self._sm_read_chunks(sid)
                     if chunks and is_summary_chunk(chunks[0]):
                         summary_msg = build_summary_chunk(new_summary)[0]
                         chunks[0] = [summary_msg] + list(chunks[0][1:])
-                        self.session_mgr.write_memory(sid, chunks)
+                        await self._sm_write_chunks(sid, chunks)
                         if self.cumulative_summary and self._summary_store is not None:
                             self._summary_store.set(sid, new_summary)
                             self._summary_store.save()
@@ -1513,7 +1563,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
                     total_tokens += self.count_tokens(content)
 
-                rounds = self.session_mgr.get_memory_count(sid)
+                rounds = await self._sm_count(sid)
                 rounds_limit = self._rounds_limit()
                 keep_now = self._dynamic_keep_turns.get(sid, self.keep_recent_turns)
 

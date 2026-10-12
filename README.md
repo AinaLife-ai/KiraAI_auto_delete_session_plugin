@@ -8,6 +8,14 @@
 
 ---
 
+## 兼容性
+
+支持 KiraAI 2.33+ 与 3.0 全系列（含 v3.0.0-rc.1；特征识别，不绑版本号）。
+v2.1.5：适配 3.0 rc.1 的会话接口全异步化与 SQLite 持久化——新增双世代会话层
+（读 `get_session`/`flatten_content`，写 `update_session(sid, content=)` upsert，
+写穿式重开照旧保留会话标题与能力设置；delete 路径已 await 化）。
+测试桩同步双世代化：3.0 下用真 SQLite 会话库跑全套集成测试。
+
 ## 先跑起来
 
 1. 把整个 `KiraAI_auto_delete_session_plugin-main` 文件夹放进 KiraAI 的 `data/plugins/` 目录。
@@ -157,6 +165,13 @@ A: ADS 按 `字符数 / chars_per_token` 估算，中文默认 2.0（一个汉�
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.1.5
+
+- **适配 3.0 rc.1 会话接口全异步化 + SQLite 持久化**：rc.1 移除 `fetch_memory`/`read_memory`/`write_memory`/`get_session_info`/`get_memory_count`，`delete_session` 等转异步——旧链路会让 `initialize()` 的必需方法检查判缺 ⇒ **插件自我禁用（优雅但功能全失）**。现新增双世代会话层（`_sm_read_flat`/`_sm_read_chunks`/`_sm_write_chunks`/`_sm_count`，`hasattr` + `isawaitable` 探测）；`initialize` 的必需方法检查改为**世代形态识别**（两代特征集满足其一即加载），不再因缺旧名自残
+- **3.0 写回语义精确对齐**：走 `update_session(sid, content=...)`（upsert；**整体替换 content，标题/描述/能力设置全部保留**）——与「写穿式重开」语义一一对应；delete+重建路径同样双世代（3.0 删除后 `update_session` upsert 自建）
+- 覆盖 11 处调用点：连续压缩、手动重开、异步摘要补写、后台合并写回、轮数/字数双触发
+- 版本 2.1.4 → 2.1.5
 
 ### 2.1.4
 
