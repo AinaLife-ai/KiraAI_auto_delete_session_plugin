@@ -1418,7 +1418,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         return self._get_event_user_id(event) in self.reset_allowed_users
 
     async def _reply(self, sid: str, text: str):
-        await self.ctx.message_processor.send_message_chain(
+        await self.ctx.send_message_chain(
             session=sid,
             chain=MessageChain([Text(text)]),
         )
