@@ -218,6 +218,11 @@ def main() -> int:
     ctx.plugin_mgr = FakePluginMgr()
     ctx.message_processor = mp
     ctx.event_bus = bus
+    # 镜像真 PluginContext：ctx 级发送就是委托给 message_processor（GA 起
+    # message_processor 侧同名方法已弃用，插件应调这里）
+    async def _ctx_send_message_chain(session=None, chain=None, **kw):
+        return await mp.send_message_chain(session=session, chain=chain, **kw)
+    ctx.send_message_chain = _ctx_send_message_chain
     ctx.get_plugin_data_dir = lambda: data_dir / "plugin_data" / "ads"
     ctx.get_llm_client = lambda model_uuid=None, llm_type=None: client
     ctx.get_default_fast_llm_client = lambda: client

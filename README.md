@@ -166,6 +166,10 @@ A: ADS 按 `字符数 / chars_per_token` 估算，中文默认 2.0（一个汉�
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.1.6
+
+- 兼容 KiraAI 3.0 GA 弃用面：`ctx.message_processor.send_message_chain` → `ctx.send_message_chain`（两代等价）。测试桩补 ctx 级发送委托；2.x/3.0 GA 54 检查通过。
+
 ### 2.1.5
 
 - **适配 3.0 rc.1 会话接口全异步化 + SQLite 持久化**：rc.1 移除 `fetch_memory`/`read_memory`/`write_memory`/`get_session_info`/`get_memory_count`，`delete_session` 等转异步——旧链路会让 `initialize()` 的必需方法检查判缺 ⇒ **插件自我禁用（优雅但功能全失）**。现新增双世代会话层（`_sm_read_flat`/`_sm_read_chunks`/`_sm_write_chunks`/`_sm_count`，`hasattr` + `isawaitable` 探测）；`initialize` 的必需方法检查改为**世代形态识别**（两代特征集满足其一即加载），不再因缺旧名自残
