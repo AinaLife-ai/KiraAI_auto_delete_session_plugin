@@ -624,7 +624,7 @@ def main() -> int:
               max(est15, plugin15._last_actual_tokens["test:dm:s15"]) == 250695)
 
         plugin16 = Plugin(ctx, mk_cfg(**{"section_basic": {"max_tokens": 1000, "chars_per_token": 2.0}}))
-        check("S16 默认口径为 no_system", plugin16.count_mode == "no_system")
+        check("S16 默认口径为 conversation", plugin16.count_mode == "conversation")
         plugin17 = Plugin(ctx, mk_cfg(**{"section_reset": {"count_mode": "delta"}}))
         plugin17._last_actual_tokens["test:dm:s17"] = 250695
         plugin17._baseline_tokens["test:dm:s17"] = 240000
@@ -640,7 +640,7 @@ def main() -> int:
                    tools=[{"name": "t", "description": "T" * 100000}])
         total18, _, _ = plugin18._counted_tokens("test:dm:s18", req18)
         full18 = plugin18._estimate_request_tokens(req18)
-        check("S18 no_system 计 tools、不计 system", total18 < full18 and total18 > 40000, f"no_system={total18} full={full18}")
+        check("S18 conversation 不计 system/工具定义", total18 < 5000 and full18 > 140000, f"conversation={total18} full={full18}")
 
 
     asyncio.run(main_run())

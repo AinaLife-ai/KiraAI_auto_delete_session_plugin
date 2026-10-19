@@ -61,14 +61,14 @@
       "count_mode": {
         "name": "token 统计口径",
         "type": "string",
-        "default": "no_system",
+        "default": "conversation",
         "options": [
-          "no_system",
+          "conversation",
           "history",
           "full",
           "delta"
         ],
-        "hint": "no_system=统计 messages + user_prompt + tools，只排除 system_prompt（默认；首轮大头是 system，等价于首轮基本不计）。history=只统计会话历史（system_prompt 与工具都不计，旧版 2.1.6 行为）。full=完整请求。delta=以重开后首轮真实 input_tokens 为基线，只统计之后的新增。"
+        "hint": "conversation=只统计对话：messages + user_prompt（工具调用结果在 messages 里，照常计）；system_prompt 与工具定义都不计（默认；首轮大头是这两块，等价于首轮基本不计）。history=只统计 messages（旧版 2.1.6 行为）。full=完整请求（含 system 与工具定义）。delta=以重开后首轮真实 input_tokens 为基线，只统计之后的新增。"
       },
       "trigger_rounds": {
         "name": "rounds 触发轮数上限",

@@ -50,9 +50,9 @@ class AutoDeleteSessionPlugin(BasePlugin):
         if self.trigger_mode not in ("tokens", "rounds", "either"):
             self.trigger_mode = "tokens"
         # token 统计口径：history=只数会话历史（旧默认）；full=含 system/user/tools
-        self.count_mode = str(reset.get("count_mode", cfg.get("count_mode", "no_system")) or "no_system").lower()
-        if self.count_mode not in ("no_system", "history", "full", "delta"):
-            self.count_mode = "no_system"
+        self.count_mode = str(reset.get("count_mode", cfg.get("count_mode", "conversation")) or "conversation").lower()
+        if self.count_mode not in ("conversation", "history", "full", "delta"):
+            self.count_mode = "conversation"
         _tr = reset.get("trigger_rounds", cfg.get("trigger_rounds", 0))
         self.trigger_rounds = int(_tr if _tr is not None else 0)
         # 缓存修复：保证 time 段离开 system prompt、随当前消息走（框架同款方式），
@@ -403,7 +403,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
             return "".join(parts)
         return str(content)
 
-    def _estimate_request_tokens(self, req: Any, include_system: bool = True) -> int:
+    def _estimate_request_tokens(self, req: Any, include_system: bool = True, include_tools: bool = True) -> int:
         """按**完整请求**估算 token：messages + system/user prompt + tools。
 
         钩子跑在 assemble_prompt() 之前，system/user/tools 还没并进 messages；
@@ -416,7 +416,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         for key in _keys:
             for pr in getattr(req, key, None) or []:
                 total += self.count_tokens(self._msg_text(pr))
-        tools = getattr(req, "tools", None)
+        tools = getattr(req, "tools", None) if include_tools else None
         if tools:
             try:
                 import json as _json
@@ -430,9 +430,9 @@ class AutoDeleteSessionPlugin(BasePlugin):
 
         history=只数会话历史（旧默认）；full=完整请求；delta=相对重开后首轮的新增。
         """
-        if self.count_mode == "no_system":
-            # 只排除 system_prompt；messages + user_prompt + tools 都计
-            est = self._estimate_request_tokens(req, include_system=False)
+        if self.count_mode == "conversation":
+            # 只统计对话：messages + user_prompt；system_prompt 与工具定义都不计
+            est = self._estimate_request_tokens(req, include_system=False, include_tools=False)
             return est, est, 0
         if self.count_mode == "full":
             est = self._estimate_request_tokens(req)
