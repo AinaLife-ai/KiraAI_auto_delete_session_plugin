@@ -49,6 +49,10 @@ class AutoDeleteSessionPlugin(BasePlugin):
         self.trigger_mode = str(reset.get("trigger_mode", cfg.get("trigger_mode", "tokens")) or "tokens").lower()
         if self.trigger_mode not in ("tokens", "rounds", "either"):
             self.trigger_mode = "tokens"
+        # token 统计口径：history=只数会话历史（旧默认）；full=含 system/user/tools
+        self.count_mode = str(reset.get("count_mode", cfg.get("count_mode", "history")) or "history").lower()
+        if self.count_mode not in ("history", "full", "delta"):
+            self.count_mode = "history"
         _tr = reset.get("trigger_rounds", cfg.get("trigger_rounds", 0))
         self.trigger_rounds = int(_tr if _tr is not None else 0)
         # 缓存修复：保证 time 段离开 system prompt、随当前消息走（框架同款方式），
@@ -208,6 +212,8 @@ class AutoDeleteSessionPlugin(BasePlugin):
         self._last_reset_time: Dict[str, float] = {}
         #: 最近一次真实 LLM 输入的 token 数（on_llm_response 记录，作为估算下限）
         self._last_actual_tokens: Dict[str, int] = {}
+        #: delta 口径的基线：重开后首轮的真实 input_tokens（只数之后的新增）
+        self._baseline_tokens: Dict[str, int] = {}
         self._summary_tasks: Dict[str, asyncio.Task] = {}
         # per-sid 锁：手动命令与自动触发、async 补写互斥
         self._locks: Dict[str, asyncio.Lock] = {}
@@ -315,6 +321,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         self._dynamic_keep_turns.clear()
         self._last_reset_time.clear()
         self._last_actual_tokens.clear()
+        self._baseline_tokens.clear()
         self._token_still_over.clear()
         for tasks in (self._summary_tasks, self._preheat_tasks, self._background_merge_tasks):
             for t in list(tasks.values()):
@@ -416,6 +423,25 @@ class AutoDeleteSessionPlugin(BasePlugin):
             except Exception:
                 pass
         return total
+
+    def _counted_tokens(self, sid: str, req: Any):
+        """按配置口径返回 (计入的 token, 估算值, 真实值)。
+
+        history=只数会话历史（旧默认）；full=完整请求；delta=相对重开后首轮的新增。
+        """
+        if self.count_mode == "full":
+            est = self._estimate_request_tokens(req)
+            actual = self._last_actual_tokens.get(sid, 0)
+            return max(est, actual), est, actual
+        if self.count_mode == "delta":
+            actual = self._last_actual_tokens.get(sid, 0)
+            base = self._baseline_tokens.get(sid)
+            return (max(0, actual - base) if base is not None else 0), 0, actual
+        total = 0
+        for msg in getattr(req, "messages", None) or []:
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            total += self.count_tokens(content)
+        return total, total, 0
 
     def _host_window(self) -> int:
         """框架会话窗口（chunk 数）。
@@ -1586,6 +1612,8 @@ class AutoDeleteSessionPlugin(BasePlugin):
             n = getattr(resp, "input_tokens", None)
             if sid and isinstance(n, int) and n > 0:
                 self._last_actual_tokens[sid] = n
+                if self.count_mode == "delta" and sid not in self._baseline_tokens:
+                    self._baseline_tokens[sid] = n
         except Exception:
             pass
 
@@ -1618,10 +1646,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     return
                 self.last_check[sid] = now
 
-                est_tokens = self._estimate_request_tokens(req)
-                actual_tokens = self._last_actual_tokens.get(sid, 0)
-                # 真实 usage 是模型实际收到的完整上下文；估算只覆盖本地可见部分
-                total_tokens = max(est_tokens, actual_tokens)
+                total_tokens, est_tokens, actual_tokens = self._counted_tokens(sid, req)
 
                 rounds = await self._sm_count(sid)
                 rounds_limit = self._rounds_limit()
@@ -1656,7 +1681,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     if self._should_compress_continuously(sid, total_tokens, rounds):
                         self._schedule_continuous_compression(sid)
                     if self.enable_summary_logging:
-                        logger.info(f"[摘要调试] {sid} token={total_tokens}(est={est_tokens},actual={actual_tokens}) rounds={rounds} 未超限（mode={self.trigger_mode}），跳过重开")
+                        logger.info(f"[摘要调试] {sid} token={total_tokens}(count={self.count_mode},est={est_tokens},actual={actual_tokens}) rounds={rounds} 未超限（mode={self.trigger_mode}），跳过重开")
                     return
 
                 # 动态降级：上次重开后仍超预算 → keep 减半（信号可靠，
@@ -1676,6 +1701,8 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     self._replace_request_messages(req, new_flat)
                     # 重开后上下文已变小：清掉旧的真实用量，下一轮重新测量
                     self._last_actual_tokens[sid] = 0
+                    # delta 口径：下一轮响应重新建立基线（首轮不计）
+                    self._baseline_tokens.pop(sid, None)
                     # 记录重开后是否仍超预算（驱动下次降级；只增 token 的场景
                     # 最多再降 5→2→1 两三次即收敛，不会无限空转）
                     est = 0

@@ -610,7 +610,7 @@ def main() -> int:
               probe2.calls == 0 and out14b[0]["content"] == "短消息" and out14b[1]["content"] == "short")
 
         # ---- S15 完整请求估算（system/user/tools 不能漏） ----
-        plugin15 = Plugin(ctx, mk_cfg(**{"section_basic": {"max_tokens": 1000, "chars_per_token": 2.0}}))
+        plugin15 = Plugin(ctx, mk_cfg(**{"section_basic": {"max_tokens": 1000, "chars_per_token": 2.0}, "section_reset": {"count_mode": "full"}}))
         req15 = LR(
             messages=[{"role": "user", "content": "hi"}],
             system_prompt=[types.SimpleNamespace(content="S" * 20000)],
@@ -622,6 +622,17 @@ def main() -> int:
         plugin15._last_actual_tokens["test:dm:s15"] = 250695
         check("S15 真实 usage 作为下限",
               max(est15, plugin15._last_actual_tokens["test:dm:s15"]) == 250695)
+
+        plugin16 = Plugin(ctx, mk_cfg(**{"section_basic": {"max_tokens": 1000, "chars_per_token": 2.0}}))
+        check("S16 默认口径为 history（不计 system_prompt）", plugin16.count_mode == "history")
+        plugin17 = Plugin(ctx, mk_cfg(**{"section_reset": {"count_mode": "delta"}}))
+        plugin17._last_actual_tokens["test:dm:s17"] = 250695
+        plugin17._baseline_tokens["test:dm:s17"] = 240000
+        total17, _, _ = plugin17._counted_tokens("test:dm:s17", LR(messages=[]))
+        check("S17 delta 只计新增", total17 == 10695, f"total={total17}")
+        plugin17._baseline_tokens.pop("test:dm:s17")
+        total17b, _, _ = plugin17._counted_tokens("test:dm:s17", LR(messages=[]))
+        check("S17 无基线首轮为 0", total17b == 0)
 
 
     asyncio.run(main_run())

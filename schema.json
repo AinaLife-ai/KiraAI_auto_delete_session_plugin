@@ -58,6 +58,17 @@
         ],
         "hint": "tokens=估算 token 超上限触发；rounds=会话轮数达框架窗口触发；either=两者先到先触发。"
       },
+      "count_mode": {
+        "name": "token 统计口径",
+        "type": "string",
+        "default": "history",
+        "options": [
+          "history",
+          "full",
+          "delta"
+        ],
+        "hint": "history=只统计会话历史 req.messages（默认，与旧版一致；system_prompt/工具定义不计）。full=统计完整请求（messages + system/user 提示 + 工具），并用 provider 真实 usage 兜底。delta=以重开后首轮的真实 input_tokens 为基线，只统计之后的新增（忽略首轮/system_prompt）。"
+      },
       "trigger_rounds": {
         "name": "rounds 触发轮数上限",
         "type": "integer",
