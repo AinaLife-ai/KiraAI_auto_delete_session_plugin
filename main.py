@@ -206,6 +206,8 @@ class AutoDeleteSessionPlugin(BasePlugin):
         self.session_mgr = None
         self._dynamic_keep_turns: Dict[str, int] = {}
         self._last_reset_time: Dict[str, float] = {}
+        #: 最近一次真实 LLM 输入的 token 数（on_llm_response 记录，作为估算下限）
+        self._last_actual_tokens: Dict[str, int] = {}
         self._summary_tasks: Dict[str, asyncio.Task] = {}
         # per-sid 锁：手动命令与自动触发、async 补写互斥
         self._locks: Dict[str, asyncio.Lock] = {}
@@ -312,6 +314,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
         self.last_check.clear()
         self._dynamic_keep_turns.clear()
         self._last_reset_time.clear()
+        self._last_actual_tokens.clear()
         self._token_still_over.clear()
         for tasks in (self._summary_tasks, self._preheat_tasks, self._background_merge_tasks):
             for t in list(tasks.values()):
@@ -367,6 +370,52 @@ class AutoDeleteSessionPlugin(BasePlugin):
         if not isinstance(text, str):
             text = str(text)
         return max(1, int(len(text) / self.chars_per_token) + 1)
+
+    @staticmethod
+    def _msg_text(obj: Any) -> str:
+        """取消息/Prompt 的可见文本：兼容 str、list[part]、Prompt。"""
+        if obj is None:
+            return ""
+        if hasattr(obj, "to_string"):
+            try:
+                return obj.to_string()
+            except Exception:
+                pass
+        content = getattr(obj, "content", obj)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, str):
+                    parts.append(p)
+                elif isinstance(p, dict):
+                    parts.append(str(p.get("text", "") or ""))
+                else:
+                    parts.append(str(getattr(p, "text", "") or ""))
+            return "".join(parts)
+        return str(content)
+
+    def _estimate_request_tokens(self, req: Any) -> int:
+        """按**完整请求**估算 token：messages + system/user prompt + tools。
+
+        钩子跑在 assemble_prompt() 之前，system/user/tools 还没并进 messages；
+        只数 messages 会把 25 万 token 的请求估成 2.4 万，永远不触发重开。
+        """
+        total = 0
+        for msg in getattr(req, "messages", None) or []:
+            total += self.count_tokens(self._msg_text(msg))
+        for key in ("system_prompt", "user_prompt"):
+            for pr in getattr(req, key, None) or []:
+                total += self.count_tokens(self._msg_text(pr))
+        tools = getattr(req, "tools", None)
+        if tools:
+            try:
+                import json as _json
+                total += self.count_tokens(_json.dumps(tools, ensure_ascii=False))
+            except Exception:
+                pass
+        return total
 
     def _host_window(self) -> int:
         """框架会话窗口（chunk 数）。
@@ -1529,6 +1578,17 @@ class AutoDeleteSessionPlugin(BasePlugin):
             if self.enable_summary_logging:
                 logger.info(f"[摘要调试] 回复后处理异常（静默）: {e}")
 
+    @on.llm_response(priority=Priority.LOW)
+    async def remember_actual_usage(self, event, resp, *_):
+        """记录 provider 返回的真实输入 token（usage），作为估算下限。"""
+        try:
+            sid = getattr(event, "sid", None)
+            n = getattr(resp, "input_tokens", None)
+            if sid and isinstance(n, int) and n > 0:
+                self._last_actual_tokens[sid] = n
+        except Exception:
+            pass
+
     @on.llm_request(priority=Priority.HIGH)
     async def maybe_reset_session(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if self.session_mgr is None or self._conflict_disabled:
@@ -1558,10 +1618,10 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     return
                 self.last_check[sid] = now
 
-                total_tokens = 0
-                for msg in req.messages:
-                    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-                    total_tokens += self.count_tokens(content)
+                est_tokens = self._estimate_request_tokens(req)
+                actual_tokens = self._last_actual_tokens.get(sid, 0)
+                # 真实 usage 是模型实际收到的完整上下文；估算只覆盖本地可见部分
+                total_tokens = max(est_tokens, actual_tokens)
 
                 rounds = await self._sm_count(sid)
                 rounds_limit = self._rounds_limit()
@@ -1596,7 +1656,7 @@ class AutoDeleteSessionPlugin(BasePlugin):
                     if self._should_compress_continuously(sid, total_tokens, rounds):
                         self._schedule_continuous_compression(sid)
                     if self.enable_summary_logging:
-                        logger.info(f"[摘要调试] {sid} token={total_tokens} rounds={rounds} 未超限（mode={self.trigger_mode}），跳过重开")
+                        logger.info(f"[摘要调试] {sid} token={total_tokens}(est={est_tokens},actual={actual_tokens}) rounds={rounds} 未超限（mode={self.trigger_mode}），跳过重开")
                     return
 
                 # 动态降级：上次重开后仍超预算 → keep 减半（信号可靠，
@@ -1614,6 +1674,8 @@ class AutoDeleteSessionPlugin(BasePlugin):
                 new_flat = await self._do_reset_locked(sid, keep_turns, reason=reason)
                 if new_flat is not None:
                     self._replace_request_messages(req, new_flat)
+                    # 重开后上下文已变小：清掉旧的真实用量，下一轮重新测量
+                    self._last_actual_tokens[sid] = 0
                     # 记录重开后是否仍超预算（驱动下次降级；只增 token 的场景
                     # 最多再降 5→2→1 两三次即收敛，不会无限空转）
                     est = 0

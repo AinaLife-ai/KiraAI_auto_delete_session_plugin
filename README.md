@@ -34,7 +34,7 @@ v2.1.5：适配 3.0 rc.1 的会话接口全异步化与 SQLite 持久化——�
 
 | 模式 | 怎么判断 | 适合谁 |
 |------|----------|--------|
-| **Token 检测** | 估算当前会话 token 数，超过上限就触发 | 关心 API 费用、怕超模型上下文窗口 |
+| **Token 检测** | 按**完整请求**估算（messages + 系统/用户提示 + 工具定义；有真实 usage 时取较大值），超过上限就触发 | 关心 API 费用、怕超模型上下文窗口 |
 | **轮数检测** | 会话轮数达到框架窗口上限就触发 | 和框架原生窗口对齐，简单粗暴 |
 | **任意触发** | token 或轮数任一先到 | 最保险的兜底方案 |
 
@@ -165,6 +165,12 @@ A: ADS 按 `字符数 / chars_per_token` 估算，中文默认 2.0（一个汉�
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.1.7
+
+- **修复「25 万 token 不触发重开」**：on_llm_request 钩子跑在 assemble_prompt() **之前**，旧实现只统计 req.messages —— system_prompt / user_prompt / tools 都还没并进去，25 万 token 的请求只估出 2.4 万，永远不触发。现在按**完整请求**估算（messages + system/user + tools），并新增 on_llm_response 记录 provider 返回的**真实 input_tokens**，触发判断取 max(估算, 真实)；重开后清零，避免旧值误触发。
+- 摘要调试日志新增 est=/actual= 分解，便于排查。
+- 版本 2.1.6 → 2.1.7
 
 ### 2.1.6
 

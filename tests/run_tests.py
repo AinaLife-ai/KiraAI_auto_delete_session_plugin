@@ -609,6 +609,21 @@ def main() -> int:
         check("S14 零待处理快路径（不调用 LLM、原样返回）",
               probe2.calls == 0 and out14b[0]["content"] == "短消息" and out14b[1]["content"] == "short")
 
+        # ---- S15 完整请求估算（system/user/tools 不能漏） ----
+        plugin15 = Plugin(ctx, mk_cfg(**{"section_basic": {"max_tokens": 1000, "chars_per_token": 2.0}}))
+        req15 = LR(
+            messages=[{"role": "user", "content": "hi"}],
+            system_prompt=[types.SimpleNamespace(content="S" * 20000)],
+            user_prompt=[types.SimpleNamespace(content="U" * 2000)],
+            tools=[{"name": "t", "description": "T" * 10000}],
+        )
+        est15 = plugin15._estimate_request_tokens(req15)
+        check("S15 估算覆盖 system/user/tools", est15 > 1000, f"est={est15}")
+        plugin15._last_actual_tokens["test:dm:s15"] = 250695
+        check("S15 真实 usage 作为下限",
+              max(est15, plugin15._last_actual_tokens["test:dm:s15"]) == 250695)
+
+
     asyncio.run(main_run())
 
     failed = [c for c in CHECKS if not c[1]]

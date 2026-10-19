@@ -9,7 +9,7 @@
         "type": "integer",
         "default": 10000,
         "minimum": 1000,
-        "hint": "会话历史估算 token 超过此值时触发重开。"
+        "hint": "按**完整请求**估算（messages + system/user 提示 + 工具定义；若有真实 usage 则取两者较大值）超过此值时触发重开。"
       },
       "chars_per_token": {
         "name": "每 token 字符数",
