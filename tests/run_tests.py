@@ -716,6 +716,32 @@ def main() -> int:
         check("S19 过期谱系不写回", not ok19)
         await plugin19.terminate()
 
+        # ---- S20 重开后 pending.buf_count 归零（新裁剪不被跳过）----
+        sid20 = "test:dm:s20"
+        cfg["bot_config"]["bot"]["max_memory_length"] = 10
+        plugin20 = Plugin(ctx, mk_cfg(
+            section_basic={"keep_recent_turns": 2, "max_tokens": 999999},
+            section_summary_optimize={"continuous_merge_strategy": "append_then_merge",
+                                      "preheat_summary": True},
+        ))
+        await plugin20.initialize()
+        await seed(sid20, 4, "s20")
+        plugin20._discard_pending[sid20] = [[{"role": "user", "content": "OLD-BUF"}]]
+        plugin20._preheat_pending[sid20] = {
+            "fp": "x", "final": "PRE", "base": "", "compressed_len": 1,
+            "anchor": [], "parts": ["PRE"], "buf_count": 1,
+        }
+        await plugin20._do_reset_with_summary(sid20, 2, reason="test20")
+        pend20 = plugin20._preheat_pending.get(sid20) or {}
+        check("S20 重开后不残留旧 buf_count", pend20.get("buf_count") in (None, 0),
+              f"buf_count={pend20.get('buf_count')}")
+        plugin20._discard_pending[sid20] = [[{"role": "user", "content": "NEW-BUF"}]]
+        await plugin20._continuous_compress_run(sid20)
+        pend20b = plugin20._preheat_pending.get(sid20) or {}
+        check("S20 新裁剪进入预热", pend20b.get("buf_count") == 1,
+              f"buf_count={pend20b.get('buf_count')}")
+        await plugin20.terminate()
+
     asyncio.run(main_run())
 
     failed = [c for c in CHECKS if not c[1]]

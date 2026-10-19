@@ -1606,6 +1606,11 @@ class AutoDeleteSessionPlugin(BasePlugin):
             self._schedule_async_summary(sid, delta_dropped, gen=reset_gen)
         # 缓冲已进入本次摘要输入（或本次模式为 off），落盘后清空
         self._discard_pending.pop(sid, None)
+        _pend = self._preheat_pending.get(sid)
+        if _pend is not None:
+            # 预热带走的是旧缓冲；清空后新裁剪必须从 0 重新计，
+            # 否则 append_then_merge 保留的 pending 会跳过之后的新裁剪。
+            _pend["buf_count"] = 0
 
         # append_then_merge 且确实用了 pending 时，保留 pending 供后台继续合并
         if not (pending_used and self.continuous_merge_strategy == "append_then_merge"):
